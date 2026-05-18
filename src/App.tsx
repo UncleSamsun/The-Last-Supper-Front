@@ -33,15 +33,6 @@ const nav: Array<{ id: Page; label: string; description: string }> = [
   { id: "lab", label: "API 테스트", description: "전체 엔드포인트 점검" },
 ];
 
-const demoAccountIds: Record<string, string> = {
-  "haeun.kim@lumenmail.kr": "guest-kim-haeun",
-  "minseo.lee@lumenmail.kr": "guest-lee-minseo",
-  "jiho.park@lumenmail.kr": "guest-park-jiho",
-  "seoyeon.choi@lumenmail.kr": "guest-choi-seoyeon",
-  "hyunwoo.jung@lumenmail.kr": "guest-jung-hyunwoo",
-  "seojin.yoon@lastsupper.kr": "owner-yoon-seojin",
-};
-
 const dayLabel: Record<DayOfWeek, string> = {
   MONDAY: "월",
   TUESDAY: "화",
@@ -115,6 +106,13 @@ function routeToPage(): Page {
 
 function isFutureSlot(slot: Pick<ReservationSlot, "date" | "startTime">) {
   return slot.date > today(0);
+}
+
+function formatReservationDateTime(slot?: Pick<ReservationSlot, "date" | "startTime"> & { weekday?: DayOfWeek }) {
+  if (!slot) return "예약 시간 확인 필요";
+  const [, month, day] = slot.date.split("-");
+  const weekday = slot.weekday ? `(${dayLabel[slot.weekday]})` : "";
+  return `${Number(month)}월 ${Number(day)}일${weekday} ${slot.startTime.slice(0, 5)}`;
 }
 
 function Badge({ value }: { value: string }) {
@@ -212,6 +210,7 @@ export default function App() {
   const [plans, setPlans] = useState<ReservationPlan[]>([]);
   const [reservations, setReservations] = useState<ReservationResponse[]>([]);
   const [waitingQueues, setWaitingQueues] = useState<WaitingQueueResponse[]>([]);
+  const [accountNames, setAccountNames] = useState<Record<string, string>>({});
   const [waitingPosition, setWaitingPosition] = useState<number | null>(null);
   const [headCount, setHeadCount] = useState(2);
   const [slotStatus, setSlotStatus] = useState<SlotStatus>("HOLD");
@@ -221,12 +220,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   const slots = useMemo(() => plans.flatMap((plan) => plan.slots.map((slot) => ({ ...slot, weekday: plan.weekday }))), [plans]);
+  const slotById = useMemo(() => new Map(slots.map((slot) => [slot.slotId, slot])), [slots]);
   const openSlots = slots.filter((slot) => slot.status === "OPEN");
-  const bookableSlots = openSlots.filter(isFutureSlot);
+  const bookableSlots = openSlots.filter((slot) => isFutureSlot(slot) && slot.remaining >= headCount);
   const selectedSlot = bookableSlots[0] ?? openSlots[0] ?? slots[0];
   const waitingCount = waitingQueues.filter((queue) => queue.waitingStatus === "WAITING").length;
-  const accountIdMismatch = !!loggedInEmail && demoAccountIds[loggedInEmail] && demoAccountIds[loggedInEmail] !== accountId;
-  const canUseAccountScopedApi = !!accountId && !accountIdMismatch;
+  const canUseAccountScopedApi = !!account;
 
   function navigate(next: Page) {
     setPage(next);
@@ -250,16 +249,20 @@ export default function App() {
     return true;
   }
 
-  function requireAccountId() {
-    if (!accountId) {
-      setError("이 API는 백엔드가 accountId 쿼리 파라미터를 요구합니다. accountId를 입력하세요.");
-      return false;
-    }
-    if (accountIdMismatch) {
-      setError(`현재 로그인(${loggedInEmail})과 accountId(${accountId})가 맞지 않습니다. 시드 계정은 ${demoAccountIds[loggedInEmail]}를 사용해야 합니다.`);
+  function requireAccount() {
+    if (!account) {
+      setError("로그인 계정 정보가 필요합니다. 다시 로그인하거나 동기화하세요.");
       return false;
     }
     return true;
+  }
+
+  async function loadAccountNames(queues: WaitingQueueResponse[], currentAccount?: AccountResponse | null) {
+    const ids = Array.from(new Set(queues.map((queue) => queue.accountId).filter(Boolean)));
+    const summaries = await lastSupperApi.getAccountSummaries(ids);
+    const nextNames = Object.fromEntries(summaries.map((summary) => [summary.id, summary.nickName]));
+    if (currentAccount) nextNames[currentAccount.id] = currentAccount.nickName;
+    setAccountNames(nextNames);
   }
 
   async function runAction<T>(label: string, action: () => Promise<T>, after?: (result: T) => void | Promise<void>) {
@@ -289,17 +292,22 @@ export default function App() {
         lastSupperApi.getAccount(),
         lastSupperApi.getRestaurant(nextRestaurantId),
         lastSupperApi.getReservationPlans(nextRestaurantId, today(0), today(14)),
-        nextAccountId ? lastSupperApi.getMyReservations(nextAccountId) : Promise.resolve([]),
+        lastSupperApi.getMyReservations(),
         lastSupperApi.getWaitingQueues(),
-        nextAccountId ? lastSupperApi.getWaitingPosition(nextAccountId).catch(() => ({ position: 0 })) : Promise.resolve({ position: 0 }),
+        lastSupperApi.getWaitingPosition().catch(() => ({ position: 0 })),
       ]);
-      return { accountData, restaurantData, planData, reservationData, queueData, positionData };
-    }, ({ accountData, restaurantData, planData, reservationData, queueData, positionData }) => {
+      const nameData = await lastSupperApi.getAccountSummaries(queueData.map((queue) => queue.accountId));
+      return { accountData, restaurantData, planData, reservationData, queueData, positionData, nameData };
+    }, ({ accountData, restaurantData, planData, reservationData, queueData, positionData, nameData }) => {
+      const nextNames = Object.fromEntries(nameData.map((summary) => [summary.id, summary.nickName]));
+      nextNames[accountData.id] = accountData.nickName;
       setAccount(accountData);
+      setAccountId(accountData.id);
       setRestaurant(restaurantData);
       setPlans(planData);
       setReservations(reservationData);
       setWaitingQueues(queueData);
+      setAccountNames(nextNames);
       setWaitingPosition(positionData.position);
     }).catch(() => undefined);
   }
@@ -313,11 +321,13 @@ export default function App() {
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    await runAction("로그인", () => lastSupperApi.login({ email: loginEmail, password: loginPassword }), async () => {
-      const nextAccountId = demoAccountIds[loginEmail] ?? "";
+    await runAction("로그인", () => lastSupperApi.login({ email: loginEmail, password: loginPassword }), async (loginResponse) => {
+      const nextAccount = loginResponse.accountResponse;
+      const nextAccountId = nextAccount.id;
+      setAccount(nextAccount);
       setLoggedInEmail(loginEmail);
       setAccountId(nextAccountId);
-      setMessage(demoAccountIds[loginEmail] ? "로그인 완료. 시드 accountId를 자동으로 맞췄습니다." : "로그인 완료. 이 계정은 백엔드에서 id 조회 API가 없어 accountId를 직접 입력해야 합니다.");
+      setMessage("로그인 완료. 백엔드 계정 id를 accountId에 자동으로 맞췄습니다.");
       await refreshDashboard({ accountId: nextAccountId });
       navigate("reservations");
     }).catch(() => undefined);
@@ -329,28 +339,38 @@ export default function App() {
       setLoginEmail(signupEmail);
       setLoginPassword(signupPassword);
       setAuthMode("login");
+      setAccount(null);
+      setLoggedInEmail("");
       setAccountId("");
-      setMessage("회원가입 완료. 로그인 후 accountId는 백엔드 조회 API가 없어 직접 입력해야 합니다.");
+      setPlans([]);
+      setReservations([]);
+      setWaitingQueues([]);
+      setAccountNames({});
+      setWaitingPosition(null);
+      setMessage("회원가입 완료. 로그인하면 백엔드 계정 id가 accountId에 자동으로 입력됩니다.");
     }).catch(() => undefined);
   }
 
   async function handleWaiting() {
-    if (!requireSession() || !requireAccountId()) return;
-    await runAction("웨이팅 등록", () => lastSupperApi.createWaiting(accountId, headCount), async () => {
-      const [queues, position] = await Promise.all([lastSupperApi.getWaitingQueues(), lastSupperApi.getWaitingPosition(accountId).catch(() => ({ position: 0 }))]);
+    if (!requireSession() || !requireAccount()) return;
+    const currentAccount = account;
+    if (!currentAccount) return;
+    await runAction("웨이팅 등록", () => lastSupperApi.createWaiting(currentAccount.id, headCount), async () => {
+      const [queues, position] = await Promise.all([lastSupperApi.getWaitingQueues(), lastSupperApi.getWaitingPosition().catch(() => ({ position: 0 }))]);
       setWaitingQueues(queues);
+      await loadAccountNames(queues, currentAccount);
       setWaitingPosition(position.position);
     }).catch(() => undefined);
   }
 
   async function handleReservation(slot?: ReservationSlot) {
-    if (!requireSession() || !requireAccountId()) return;
+    if (!requireSession() || !requireAccount()) return;
     const targetSlot = slot ?? selectedSlot;
-    if (!targetSlot || targetSlot.status !== "OPEN" || !isFutureSlot(targetSlot)) {
+    if (!targetSlot || targetSlot.status !== "OPEN" || !isFutureSlot(targetSlot) || targetSlot.remaining < headCount) {
       setError("예약 가능한 미래 OPEN 슬롯이 없습니다.");
       return;
     }
-    await runAction("예약 생성", () => lastSupperApi.createReservation(accountId, {
+    await runAction("예약 생성", () => lastSupperApi.createReservation({
       slotId: targetSlot.slotId,
       representativeName: account?.nickName ?? "예약자",
       representativePhone: account?.phone ?? "010-0000-0000",
@@ -361,18 +381,18 @@ export default function App() {
   }
 
   async function handleCancelWaiting() {
-    if (!requireSession() || !requireAccountId()) return;
-    await runAction("웨이팅 취소", () => lastSupperApi.cancelWaiting(accountId), () => refreshDashboard()).catch(() => undefined);
+    if (!requireSession() || !requireAccount()) return;
+    await runAction("웨이팅 취소", () => lastSupperApi.cancelWaiting(), () => refreshDashboard()).catch(() => undefined);
   }
 
   async function handleDelayWaiting() {
-    if (!requireSession() || !requireAccountId()) return;
-    await runAction("웨이팅 미루기", () => lastSupperApi.delayWaiting(accountId), () => refreshDashboard()).catch(() => undefined);
+    if (!requireSession() || !requireAccount()) return;
+    await runAction("웨이팅 미루기", () => lastSupperApi.delayWaiting(), () => refreshDashboard()).catch(() => undefined);
   }
 
   async function handleSetting(category: WaitingSetCategory) {
     if (!requireSession()) return;
-    await runAction(`웨이팅 ${category}`, () => lastSupperApi.updateWaitingSetting(restaurantId, category)).catch(() => undefined);
+    await runAction(`웨이팅 ${category}`, () => lastSupperApi.updateWaitingSetting(restaurantId, category), () => refreshDashboard()).catch(() => undefined);
   }
 
   async function runApiTests() {
@@ -381,10 +401,6 @@ export default function App() {
     const unique = Date.now().toString().slice(-6);
     const openSlotStartOffset = 40 + Number(unique.slice(-2));
     const signupEmailForTest = `ian${unique}@lumenmail.kr`;
-    const reservationAccountId = "guest-chae-rina";
-    const waitingAccountId = "guest-kang-doyun";
-    const waitingDelayAccountId = "guest-choi-seoyeon";
-    const waitingCancelAccountId = "guest-park-jiho";
     const modifyHistoryId = "reservation-supper-008";
     const cancelHistoryId = "reservation-supper-007";
     let apiReservationSlot: ReservationSlot | null = null;
@@ -447,46 +463,49 @@ export default function App() {
     await test("예약 플랜 조회", () => lastSupperApi.getReservationPlans(restaurantId, today(0), today(14)));
     await test("예약 생성", () => {
       if (!apiReservationSlot) throw new Error("예약 생성용 동적 슬롯이 없습니다.");
-      return lastSupperApi.createReservation(reservationAccountId, { slotId: apiReservationSlot.slotId, representativeName: "채리나", representativePhone: "010-8888-2026", isProxyAttendee: false, totalVisitors: 1, request: "늦은 생일 식사라 조용한 좌석을 부탁드립니다." });
+      return lastSupperApi.createReservation({ slotId: apiReservationSlot.slotId, representativeName: account?.nickName ?? "예약자", representativePhone: account?.phone ?? "010-8888-2026", isProxyAttendee: false, totalVisitors: 1, request: "늦은 생일 식사라 조용한 좌석을 부탁드립니다." });
     }, {
       skipWhen: (caught) => hasErrorText(caught, ["동적 슬롯이 없습니다", "RESERVATION_DUPLICATE_RESERVATION", "이미 예약이 존재합니다"]) ? "예약 생성용 슬롯이 없거나 이미 예약된 상태입니다. seed 후 전체 검증하면 생성까지 재확인됩니다." : false,
     });
-    await test("내 예약 전체 조회", () => lastSupperApi.getMyReservations(reservationAccountId));
+    await test("내 예약 전체 조회", () => lastSupperApi.getMyReservations());
     await test("내 예약 단건 조회", () => {
       if (!apiReservationSlot) throw new Error("단건 조회용 동적 슬롯이 없습니다.");
-      return lastSupperApi.getReservationByDate({ accountId: reservationAccountId, date: apiReservationSlot.date, time: apiReservationSlot.startTime });
+      return lastSupperApi.getReservationByDate({ date: apiReservationSlot.date, time: apiReservationSlot.startTime });
     }, {
       skipWhen: (caught) => hasErrorText(caught, ["동적 슬롯이 없습니다", "RESERVATION_NOT_FOUND", "예약을 찾을 수 없습니다"]) ? "생성 테스트가 건너뛰어 단건 조회 대상이 없습니다." : false,
     });
-    await test("예약 수정", () => lastSupperApi.modifyReservation(modifyHistoryId, "guest-seo-nari", { slotId: futureReservedSlotId, representativeName: "서나리", representativePhone: "010-8777-2643", isProxyAttendee: false, totalVisitors: 4, request: "와인 페어링은 2인만 추가하고 싶습니다." }), {
-      skipWhen: (caught) => hasErrorText(caught, ["RESERVATION_NOT_FOUND", "RESERVATION_ACCOUNT_NOT_FOUND", "예약을 찾을 수 없습니다"]) ? "수정 대상 seed 예약이 이미 처리됐습니다. seed 후 재검증하세요." : false,
+    await test("예약 수정", () => lastSupperApi.modifyReservation(modifyHistoryId, { slotId: futureReservedSlotId, representativeName: account?.nickName ?? "예약자", representativePhone: account?.phone ?? "010-8777-2643", isProxyAttendee: false, totalVisitors: 4, request: "와인 페어링은 2인만 추가하고 싶습니다." }), {
+      skipWhen: (caught) => hasErrorText(caught, ["RESERVATION_NOT_FOUND", "RESERVATION_ACCOUNT_NOT_FOUND", "예약을 찾을 수 없습니다", "id가 일치하지 않습니다"]) ? "수정 대상 예약이 현재 로그인 계정 소유가 아니거나 이미 처리됐습니다. 본인 예약 생성 후 재검증하세요." : false,
     });
-    await test("예약 취소", () => lastSupperApi.cancelReservation(cancelHistoryId, cancelSlotId, "guest-oh-yujun"), {
-      skipWhen: (caught) => hasErrorText(caught, ["RESERVATION_NOT_FOUND", "이미 취소", "예약을 찾을 수 없습니다"]) ? "취소 대상 seed 예약이 이미 처리됐습니다. seed 후 재검증하세요." : false,
+    await test("예약 취소", () => lastSupperApi.cancelReservation(cancelHistoryId, cancelSlotId), {
+      skipWhen: (caught) => hasErrorText(caught, ["RESERVATION_NOT_FOUND", "이미 취소", "예약을 찾을 수 없습니다", "권한", "id가 일치하지 않습니다"]) ? "취소 대상 예약이 현재 로그인 계정 소유가 아니거나 이미 처리됐습니다. 본인 예약 생성 후 재검증하세요." : false,
     });
     await test("웨이팅 등록", async () => {
       await lastSupperApi.updateWaitingSetting(restaurantId, "OPEN").catch(() => undefined);
-      await lastSupperApi.cancelWaiting(waitingAccountId).catch(() => undefined);
-      return lastSupperApi.createWaiting(waitingAccountId, 2);
+      await lastSupperApi.cancelWaiting().catch(() => undefined);
+      if (!account) throw new Error("로그인 계정 정보가 없습니다.");
+      return lastSupperApi.createWaiting(account.id, 2);
     }, {
       skipWhen: (caught) => hasErrorText(caught, ["ALREADY_WAITING", "이미 웨이팅"]) ? "이미 웨이팅 중인 테스트 계정입니다. 취소 후 다시 실행하세요." : false,
     });
-    await test("웨이팅 위치 조회", () => lastSupperApi.getWaitingPosition(waitingAccountId), {
+    await test("웨이팅 위치 조회", () => lastSupperApi.getWaitingPosition(), {
       skipWhen: (caught) => hasErrorText(caught, ["WAITING_NOT_FOUND", "웨이팅을 찾을 수 없습니다"]) ? "현재 웨이팅이 없어 위치 조회 대상이 없습니다." : false,
     });
     await test("웨이팅 지연", async () => {
       await lastSupperApi.updateWaitingSetting(restaurantId, "OPEN").catch(() => undefined);
-      await lastSupperApi.cancelWaiting(waitingDelayAccountId).catch(() => undefined);
-      await lastSupperApi.createWaiting(waitingDelayAccountId, 2);
-      return lastSupperApi.delayWaiting(waitingDelayAccountId);
+      await lastSupperApi.cancelWaiting().catch(() => undefined);
+      if (!account) throw new Error("로그인 계정 정보가 없습니다.");
+      await lastSupperApi.createWaiting(account.id, 2);
+      return lastSupperApi.delayWaiting();
     }, {
       skipWhen: (caught) => hasErrorText(caught, ["WAITING_NOT_FOUND", "웨이팅을 찾을 수 없습니다", "ALREADY_LAST_WAITING", "이전 웨이팅이 없습니다"]) ? "지연 가능한 앞 대기팀이 없어 이 케이스는 건너뜁니다." : false,
     });
     await test("웨이팅 취소", async () => {
       await lastSupperApi.updateWaitingSetting(restaurantId, "OPEN").catch(() => undefined);
-      await lastSupperApi.cancelWaiting(waitingCancelAccountId).catch(() => undefined);
-      await lastSupperApi.createWaiting(waitingCancelAccountId, 2);
-      return lastSupperApi.cancelWaiting(waitingCancelAccountId);
+      await lastSupperApi.cancelWaiting().catch(() => undefined);
+      if (!account) throw new Error("로그인 계정 정보가 없습니다.");
+      await lastSupperApi.createWaiting(account.id, 2);
+      return lastSupperApi.cancelWaiting();
     }, {
       skipWhen: (caught) => hasErrorText(caught, ["WAITING_NOT_FOUND", "웨이팅을 찾을 수 없습니다"]) ? "취소할 웨이팅 대상이 없습니다. seed 후 재검증하세요." : false,
     });
@@ -520,7 +539,7 @@ export default function App() {
         </div>
         <div className="mt-6 rounded-md border border-white/10 bg-white/5 p-3 text-xs leading-5 text-white/70">
           <b className="text-white">주의</b><br />
-          백엔드 일부 API는 JWT 대신 accountId 쿼리를 요구합니다. 로그인 계정과 accountId가 다르면 프론트가 요청을 막습니다.
+          고객 예약과 웨이팅 API는 JWT에서 로그인 계정을 식별합니다. accountId는 화면 확인용으로만 표시됩니다.
         </div>
       </aside>
 
@@ -550,8 +569,6 @@ export default function App() {
           </div>
 
           {error ? <div className="rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm font-semibold text-rose-800">{error}</div> : null}
-          {accountIdMismatch ? <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm font-semibold text-amber-800">현재 로그인 이메일과 accountId가 맞지 않습니다. 이전 계정의 웨이팅/예약 요청을 막았습니다.</div> : null}
-
           {page === "session" ? (
             <div className="grid gap-4 xl:grid-cols-[1fr_1fr]">
               <Panel title={authMode === "login" ? "로그인" : "회원가입"} eyebrow="Session">
@@ -564,7 +581,7 @@ export default function App() {
                     <Field label="email" name="email" value={loginEmail} onChange={setLoginEmail} />
                     <Field label="password" name="password" type="password" value={loginPassword} onChange={setLoginPassword} />
                     <Button type="submit" disabled={busy}>로그인</Button>
-                    <Button variant="light" onClick={() => { tokenStore.clear(); setAccount(null); setLoggedInEmail(""); setAccountId(""); setPlans([]); setReservations([]); setWaitingQueues([]); setWaitingPosition(null); setMessage("세션과 화면 상태를 초기화했습니다."); }}>로그아웃/상태 초기화</Button>
+                    <Button variant="light" onClick={() => { tokenStore.clear(); setAccount(null); setLoggedInEmail(""); setAccountId(""); setPlans([]); setReservations([]); setWaitingQueues([]); setAccountNames({}); setWaitingPosition(null); setMessage("세션과 화면 상태를 초기화했습니다."); }}>로그아웃/상태 초기화</Button>
                   </form>
                 ) : (
                   <form className="grid gap-3" onSubmit={handleSignup}>
@@ -573,14 +590,14 @@ export default function App() {
                     <Field label="nickName" name="nickName" value={signupNickName} onChange={setSignupNickName} />
                     <Field label="password" name="password" type="password" value={signupPassword} onChange={setSignupPassword} />
                     <Button type="submit" variant="green" disabled={busy}>회원가입</Button>
-                    <p className="rounded-md bg-stone-100 p-3 text-xs leading-5 text-stone-600">새 계정은 백엔드 응답에 accountId가 없어 예약/웨이팅 테스트 전 DB id를 직접 입력해야 합니다.</p>
+                    <p className="rounded-md bg-stone-100 p-3 text-xs leading-5 text-stone-600">회원가입 후 로그인하면 백엔드 계정 id와 닉네임을 자동으로 동기화합니다.</p>
                   </form>
                 )}
               </Panel>
               <Panel title="연결 상태" eyebrow="Context">
                 <div className="grid gap-3">
                   <p className="text-sm text-stone-600"><b className="text-stone-950">계정</b> {account ? `${account.nickName} · ${account.email}` : "로그인 필요"}</p>
-                  <Field label="accountId" value={accountId} onChange={setAccountId} />
+                  <p className="rounded-md bg-stone-100 p-3 text-sm text-stone-600"><b className="text-stone-950">accountId</b> {accountId || "로그인 후 자동 표시"}</p>
                   <Field label="restaurantId" value={restaurantId} onChange={setRestaurantId} />
                   <Button onClick={refreshDashboard} variant="light">현재 컨텍스트로 동기화</Button>
                 </div>
@@ -593,7 +610,7 @@ export default function App() {
               <Panel title="예약 슬롯" eyebrow="Reservation book">
                 <div className="grid gap-3 md:grid-cols-2">
                   {slots.length ? slots.map((slot) => (
-                    <button key={slot.slotId} className="rounded-md border border-stone-200 bg-white p-4 text-left hover:border-stone-400 disabled:opacity-60" disabled={slot.status !== "OPEN" || !isFutureSlot(slot) || !canUseAccountScopedApi} onClick={() => handleReservation(slot)}>
+                    <button key={slot.slotId} className="rounded-md border border-stone-200 bg-white p-4 text-left hover:border-stone-400 disabled:opacity-60" disabled={slot.status !== "OPEN" || !isFutureSlot(slot) || slot.remaining < headCount || !canUseAccountScopedApi} onClick={() => handleReservation(slot)}>
                       <div className="flex items-center justify-between gap-3">
                         <div><p className="text-sm text-stone-500">{slot.date} ({dayLabel[slot.weekday]})</p><p className="text-2xl font-bold">{slot.startTime.slice(0, 5)}</p></div>
                         <Badge value={slot.status} />
@@ -607,14 +624,21 @@ export default function App() {
                 <div className="grid gap-3">
                   <Field label="예약 인원" type="number" min={1} value={headCount} onChange={(value) => setHeadCount(Number(value))} />
                   <Button disabled={!canUseAccountScopedApi || !bookableSlots.length} onClick={() => handleReservation()}>첫 예약 가능 슬롯 예약</Button>
-                  <Button variant="light" onClick={() => accountId && lastSupperApi.getMyReservations(accountId).then(setReservations).catch((caught) => setError(explain(caught)))}>내 예약 다시 조회</Button>
+                  <Button variant="light" onClick={() => refreshDashboard()}>내 예약 다시 조회</Button>
                 </div>
                 <div className="mt-5 grid gap-2">
-                  {reservations.map((reservation, index) => (
-                    <div key={`${reservation.slotId}-${index}`} className="flex items-center justify-between rounded-md border border-stone-200 px-3 py-3 text-sm">
-                      <span>{reservation.slotId} · {reservation.reservedPeople}명</span><Badge value={reservation.status} />
-                    </div>
-                  ))}
+                  {reservations.map((reservation, index) => {
+                    const slot = slotById.get(reservation.slotId);
+                    return (
+                      <div key={`${reservation.slotId}-${index}`} className="flex items-center justify-between gap-3 rounded-md border border-stone-200 px-3 py-3 text-sm">
+                        <span>
+                          <b className="text-stone-950">{account?.nickName ?? "내 예약"}</b>
+                          <span className="text-stone-500"> · {formatReservationDateTime(slot)} · {reservation.reservedPeople}명</span>
+                        </span>
+                        <Badge value={reservation.status} />
+                      </div>
+                    );
+                  })}
                 </div>
               </Panel>
             </div>
@@ -628,13 +652,14 @@ export default function App() {
                   <Button variant="danger" disabled={!canUseAccountScopedApi} onClick={handleWaiting}>웨이팅 등록</Button>
                   <Button variant="light" disabled={!canUseAccountScopedApi} onClick={handleDelayWaiting}>내 웨이팅 미루기</Button>
                   <Button variant="light" disabled={!canUseAccountScopedApi} onClick={handleCancelWaiting}>내 웨이팅 취소</Button>
+                  <Button variant="light" disabled={!canUseAccountScopedApi} onClick={() => refreshDashboard()}>대기 큐 새로고침</Button>
                 </div>
               </Panel>
               <Panel title="서버 대기 큐" eyebrow="Live">
                 <div className="grid gap-2">
                   {waitingQueues.length ? waitingQueues.map((queue) => (
                     <div key={queue.waitingQueueId} className="grid grid-cols-[72px_1fr_auto] items-center gap-3 rounded-md border border-stone-200 px-4 py-3">
-                      <b>{queue.number}번</b><span className="text-sm text-stone-600">{queue.accountId} · {queue.headCount}명</span><Badge value={queue.waitingStatus} />
+                      <b>{queue.number}번</b><span className="text-sm text-stone-600">{accountNames[queue.accountId] ?? queue.accountId} · {queue.headCount}명</span><Badge value={queue.waitingStatus} />
                     </div>
                   )) : <EmptyState text="대기 큐가 없습니다." />}
                 </div>

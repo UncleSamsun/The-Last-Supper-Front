@@ -12,6 +12,7 @@ import {
 import type {
   ApiEnvelope,
   AccountResponse,
+  AccountSummaryResponse,
   AccountUpdateRequest,
   LoginResponse,
   LoginRequest,
@@ -67,11 +68,24 @@ export const lastSupperApi = {
     );
     const token = response.tokenDTO;
     tokenStore.set(token.accessToken);
-    return token;
+    return response;
   },
 
   async getAccount() {
     return withMockFallback(() => apiRequest<AccountResponse>("/api/v1/customers"), mockAccount);
+  },
+
+  async getAccountSummaries(accountIds: string[]) {
+    const uniqueIds = Array.from(new Set(accountIds.filter(Boolean)));
+    if (!uniqueIds.length) return [];
+    return withMockFallback(
+      () =>
+        apiRequest<AccountSummaryResponse[]>("/api/v1/customers/summaries", {
+          method: "POST",
+          body: JSON.stringify({ accountIds: uniqueIds }),
+        }),
+      uniqueIds.map((id) => ({ id, nickName: id === mockAccount.id ? mockAccount.nickName : id })),
+    );
   },
 
   async updateAccount(payload: AccountUpdateRequest) {
@@ -119,16 +133,15 @@ export const lastSupperApi = {
     );
   },
 
-  async createReservation(accountId: string, payload: ReservationRequest) {
+  async createReservation(payload: ReservationRequest) {
     return withMockFallback(
       () =>
         apiRequest<ReservationResponse>("/api/v1/reservation", {
           method: "POST",
-          query: { accountId },
           body: JSON.stringify(payload),
         }),
       {
-        accountId,
+        accountId: mockAccount.id,
         slotId: payload.slotId,
         request: payload.request,
         status: "CONFIRMED",
@@ -139,82 +152,79 @@ export const lastSupperApi = {
     );
   },
 
-  async getMyReservations(accountId: string) {
+  async getMyReservations() {
     return withMockFallback(
-      () => apiRequest<ReservationResponse[]>("/api/v1/reservation/me/all", { query: { accountId } }),
+      () => apiRequest<ReservationResponse[]>("/api/v1/reservation/me/all"),
       mockReservations,
     );
   },
 
   async getReservationByDate(query: ReservationLookupQuery) {
     return withMockFallback(
-      () => apiRequest<ReservationResponse>("/api/v1/reservation/me", { query: { accountId: query.accountId, date: query.date, time: query.time } }),
+      () => apiRequest<ReservationResponse>("/api/v1/reservation/me", { query: { date: query.date, time: query.time } }),
       mockReservations[0],
     );
   },
 
-  async modifyReservation(historyId: string, accountId: string, payload: ReservationRequest) {
+  async modifyReservation(historyId: string, payload: ReservationRequest) {
     return withMockFallback(
       () =>
         apiRequest<ReservationResponse>(`/api/v1/reservation/${historyId}`, {
           method: "PATCH",
-          query: { accountId },
           body: JSON.stringify(payload),
         }),
-      { accountId, slotId: payload.slotId, request: payload.request, status: "CONFIRMED", rejectionReason: null, reservedPeople: payload.totalVisitors, visible: true },
+      { accountId: mockAccount.id, slotId: payload.slotId, request: payload.request, status: "CONFIRMED", rejectionReason: null, reservedPeople: payload.totalVisitors, visible: true },
     );
   },
 
-  async cancelReservation(historyId: string, slotId: string, accountId: string) {
+  async cancelReservation(historyId: string, slotId: string) {
     return withMockFallback(
-      () => apiRequest<void>(`/api/v1/reservation/${historyId}`, { method: "DELETE", query: { slotId, accountId } }),
+      () => apiRequest<void>(`/api/v1/reservation/${historyId}`, { method: "DELETE", query: { slotId } }),
       undefined,
     );
   },
 
-  async createWaiting(accountId: string, headCount: number) {
+  async createWaiting(currentAccountId: string, headCount: number) {
     return withMockFallback(
       async () => {
         await apiRequest<void>("/api/v1/waiting", {
           method: "POST",
-          query: { accountId },
           body: JSON.stringify({ headCount }),
         });
 
         for (let attempt = 0; attempt < 10; attempt += 1) {
           const queues = await this.getWaitingQueues();
-          const current = queues.find((queue) => queue.accountId === accountId && queue.waitingStatus === "WAITING");
+          const current = queues.find((queue) => queue.accountId === currentAccountId && queue.waitingStatus === "WAITING");
           if (current) return current;
           await sleep(250);
         }
 
-        return { ...mockWaiting, accountId, headCount };
+        return { ...mockWaiting, accountId: currentAccountId, headCount };
       },
-      { ...mockWaiting, accountId, headCount },
+      { ...mockWaiting, accountId: currentAccountId, headCount },
     );
   },
 
-  async getWaitingPosition(accountId: string) {
+  async getWaitingPosition() {
     return withMockFallback(
-      () => apiRequest<WaitingPositionResponse>("/api/v1/waiting/position", { query: { accountId } }),
+      () => apiRequest<WaitingPositionResponse>("/api/v1/waiting/position"),
       mockWaitingPosition,
     );
   },
 
-  async cancelWaiting(accountId: string) {
+  async cancelWaiting() {
     return withMockFallback(
       () =>
         apiRequest<WaitingResponse>("/api/v1/waiting/cancel", {
           method: "POST",
-          query: { accountId },
         }),
-      { ...mockWaiting, accountId, waitingStatus: "CANCEL" },
+      { ...mockWaiting, accountId: mockAccount.id, waitingStatus: "CANCEL" },
     );
   },
 
-  async delayWaiting(accountId: string) {
+  async delayWaiting() {
     return withMockFallback(
-      () => apiRequest<void>("/api/v1/waiting/delay", { method: "POST", query: { accountId } }),
+      () => apiRequest<void>("/api/v1/waiting/delay", { method: "POST" }),
       undefined,
     );
   },

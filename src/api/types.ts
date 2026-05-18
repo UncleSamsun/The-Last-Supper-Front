@@ -47,9 +47,15 @@ export interface LoginResponse {
 }
 
 export interface AccountResponse {
+  id: string;
   email: string;
   nickName: string;
   phone: string;
+}
+
+export interface AccountSummaryResponse {
+  id: string;
+  nickName: string;
 }
 
 export interface AccountUpdateRequest {
@@ -116,7 +122,6 @@ export interface ReservationResponse {
 }
 
 export interface ReservationLookupQuery {
-  accountId: string;
   date: string;
   time: string;
 }

@@ -10,6 +10,7 @@ import type {
 } from "./types";
 
 export const mockAccount: AccountResponse = {
+  id: "guest-kim-haeun",
   email: "haeun.kim@lumenmail.kr",
   nickName: "김하은",
   phone: "010-4821-7305",
